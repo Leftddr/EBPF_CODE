@@ -1,0 +1,593 @@
+ 
+            #include <linux/sched.h> 
+            #include <uapi/linux/ptrace.h> 
+            #include <uapi/linux/bpf.h> 
+            #include "include/mbuf.h" 
+            #include "include/packet.h" 
+            #define PACKET_PARSE 32 
+            #define EVENT_BATCH 10 
+            #define ETHER_TYPE 8 
+            #define IPV4_TYPE 4 
+            #define TCP_TYPE 6 
+            struct data_type { 
+                u32 src_addr, dst_addr; 
+                u16 src_port, dst_port; 
+                u32 pid; 
+                u64 ts; 
+                u64 pkt_len; 
+                u64 e_count; 
+                u32 sent_seq, recv_ack; 
+                u8 evt_type; 
+            }; 
+            struct event_type { 
+                struct data_type arr[EVENT_BATCH]; 
+            }; 
+            struct flow_info { 
+                u32 src_addr, dst_addr; 
+                u32 src_port, dst_port; 
+            }; 
+            BPF_RINGBUF_OUTPUT(virtio_dev_tx_ringbuf, 1024); 
+            BPF_RINGBUF_OUTPUT(mlx5_tx_burst_ringbuf, 1024); 
+            BPF_RINGBUF_OUTPUT(virtio_dev_rx_ringbuf, 1024); 
+            BPF_RINGBUF_OUTPUT(mlx5_rx_burst_ringbuf, 1024); 
+            BPF_HASH(tx_poll_count, u32); 
+            BPF_HASH(rx_poll_count, u32); 
+            BPF_QUEUE(virtio_dev_tx_queue, struct data_type, 10240);  
+            BPF_QUEUE(mlx5_tx_burst_queue, struct data_type, 10240);  
+            BPF_QUEUE(virtio_dev_rx_queue, struct data_type, 10240);  
+            BPF_QUEUE(mlx5_rx_burst_queue, struct data_type, 10240);  
+            BPF_ARRAY(virtio_dev_tx_array, struct data_type, 64);  
+            BPF_ARRAY(mlx5_tx_burst_array, struct data_type, 64);  
+            BPF_ARRAY(virtio_dev_rx_array, struct data_type, 64);  
+            BPF_ARRAY(mlx5_rx_burst_array, struct data_type, 64);  
+            BPF_HASH(virtio_dev_tx_index, struct flow_info, u32);  
+            BPF_HASH(mlx5_tx_burst_index, struct flow_info, u32);  
+            BPF_HASH(virtio_dev_rx_index, struct flow_info, u32);  
+            BPF_HASH(mlx5_rx_burst_index, struct flow_info, u32);  
+            BPF_HASH(virtio_dev_tx_pkt_len, struct flow_info);  
+            BPF_HASH(mlx5_tx_burst_pkt_len, struct flow_info);  
+            BPF_HASH(virtio_dev_rx_pkt_len, struct flow_info);  
+            BPF_HASH(mlx5_rx_burst_pkt_len, struct flow_info);  
+            BPF_HASH(virtio_dev_tx_used, struct flow_info, u8);  
+            BPF_HASH(mlx5_tx_burst_used, struct flow_info, u8);  
+            BPF_HASH(virtio_dev_rx_used, struct flow_info, u8);  
+            BPF_HASH(mlx5_rx_burst_used, struct flow_info, u8); 
+            static inline void output_queue(int which_ringbuf){ 
+                struct event_type *event; 
+                if(which_ringbuf == 0) event = virtio_dev_tx_ringbuf.ringbuf_reserve(sizeof(struct event_type)); 
+                else if(which_ringbuf == 1) event = mlx5_tx_burst_ringbuf.ringbuf_reserve(sizeof(struct event_type)); 
+                else if(which_ringbuf == 2) event = virtio_dev_rx_ringbuf.ringbuf_reserve(sizeof(struct event_type)); 
+                else event = mlx5_rx_burst_ringbuf.ringbuf_reserve(sizeof(struct event_type)); 
+                if(event == NULL) return; 
+                 
+                for(u32 i = 0 ; i < EVENT_BATCH ; i++){ 
+                    struct data_type *data = NULL; 
+                    u32 key = i; 
+                    if(which_ringbuf == 0) data = virtio_dev_tx_array.lookup(&key); 
+                    else if(which_ringbuf == 1) data = mlx5_tx_burst_array.lookup(&key); 
+                    else if(which_ringbuf == 2) data = virtio_dev_rx_array.lookup(&key); 
+                    else data = mlx5_rx_burst_array.lookup(&key); 
+                    if(data == NULL) continue; 
+                    bpf_probe_read_kernel(&(event->arr[i]), sizeof(struct data_type), data); 
+                } 
+                if(which_ringbuf == 0) virtio_dev_tx_ringbuf.ringbuf_submit(event, 0); 
+                else if(which_ringbuf == 1) mlx5_tx_burst_ringbuf.ringbuf_submit(event, 0); 
+                else if(which_ringbuf == 2) virtio_dev_rx_ringbuf.ringbuf_submit(event, 0); 
+                else mlx5_rx_burst_ringbuf.ringbuf_submit(event, 0); 
+            }int virtio_dev_tx_split(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = tx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM4(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = virtio_dev_tx_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = virtio_dev_tx_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            virtio_dev_tx_pkt_len.update(&fi, pkt_len); 
+            virtio_dev_tx_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = virtio_dev_tx_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = virtio_dev_tx_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = virtio_dev_tx_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 0; 
+            virtio_dev_tx_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(0); 
+                virtio_dev_tx_index.update(&fi, (u32*)&zero); 
+            } 
+            else virtio_dev_tx_index.update(&fi, array_index); 
+            virtio_dev_tx_used.update(&fi, (u8*)&zero); 
+            } 
+             
+            tx_poll_count.update(&pid, e_count);return  0;}int virtio_dev_tx_packed(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = tx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM4(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = virtio_dev_tx_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = virtio_dev_tx_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            virtio_dev_tx_pkt_len.update(&fi, pkt_len); 
+            virtio_dev_tx_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = virtio_dev_tx_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = virtio_dev_tx_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = virtio_dev_tx_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 0; 
+            virtio_dev_tx_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(0); 
+                virtio_dev_tx_index.update(&fi, (u32*)&zero); 
+            } 
+            else virtio_dev_tx_index.update(&fi, array_index); 
+            virtio_dev_tx_used.update(&fi, (u8*)&zero); 
+            } 
+             
+            tx_poll_count.update(&pid, e_count);return  0;}int mlx5_tx_burst_none_empw(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = tx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM2(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = mlx5_tx_burst_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = mlx5_tx_burst_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            mlx5_tx_burst_pkt_len.update(&fi, pkt_len); 
+            mlx5_tx_burst_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = mlx5_tx_burst_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = mlx5_tx_burst_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = mlx5_tx_burst_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 1; 
+            mlx5_tx_burst_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(1); 
+                mlx5_tx_burst_index.update(&fi, (u32*)&zero); 
+            } 
+            else mlx5_tx_burst_index.update(&fi, array_index); 
+            mlx5_tx_burst_used.update(&fi, (u8*)&zero); 
+            } 
+            *e_count += 1; 
+            tx_poll_count.update(&pid, e_count);return  0;}int virtio_dev_rx_split(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = rx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM4(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = virtio_dev_rx_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = virtio_dev_rx_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            virtio_dev_rx_pkt_len.update(&fi, pkt_len); 
+            virtio_dev_rx_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = virtio_dev_rx_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = virtio_dev_rx_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = virtio_dev_rx_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 2; 
+            virtio_dev_rx_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(2); 
+                virtio_dev_rx_index.update(&fi, (u32*)&zero); 
+            } 
+            else virtio_dev_rx_index.update(&fi, array_index); 
+            virtio_dev_rx_used.update(&fi, (u8*)&zero); 
+            } 
+             
+            rx_poll_count.update(&pid, e_count);return  0;}int virtio_dev_rx_packed(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = rx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM4(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = virtio_dev_rx_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = virtio_dev_rx_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            virtio_dev_rx_pkt_len.update(&fi, pkt_len); 
+            virtio_dev_rx_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = virtio_dev_rx_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = virtio_dev_rx_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = virtio_dev_rx_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 2; 
+            virtio_dev_rx_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(2); 
+                virtio_dev_rx_index.update(&fi, (u32*)&zero); 
+            } 
+            else virtio_dev_rx_index.update(&fi, array_index); 
+            virtio_dev_rx_used.update(&fi, (u8*)&zero); 
+            } 
+             
+            rx_poll_count.update(&pid, e_count);return  0;}int mlx5_rx_burst_vec(struct pt_regs *ctx){ 
+            u32 pid = bpf_get_current_pid_tgid(); 
+            u64 zero = 0, one = 1; 
+            u64 *e_count = rx_poll_count.lookup_or_try_init(&pid, &zero); 
+            if(e_count == NULL) return 0; 
+            struct rte_mbuf **pkts = (struct rte_mbuf**)PT_REGS_PARM2(ctx); 
+            s32 pkt_cnt = PT_REGS_RC(ctx); 
+            if(!pkt_cnt) return 0; 
+            union { 
+                struct rte_ether_hdr *eth; 
+                struct rte_vlan_hdr *vlan; 
+                struct rte_ipv4_hdr *ipv4; 
+                struct rte_ipv6_hdr *ipv6; 
+                struct rte_tcp_hdr *tcp; 
+                struct rte_udp_hdr *udp; 
+                uint8_t *byte; 
+            }h; 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u64 *pkt_len = mlx5_rx_burst_pkt_len.lookup_or_try_init(&fi, &zero); 
+            if(pkt_len == NULL) continue; 
+            u8 *used = mlx5_rx_burst_used.lookup_or_try_init(&fi, (u8*)&zero); 
+            if(used == NULL) continue;  
+            *pkt_len += mbuf->pkt_len; 
+            mlx5_rx_burst_pkt_len.update(&fi, pkt_len); 
+            mlx5_rx_burst_used.update(&fi, (u8*)&one); 
+            } 
+            for(int i = 0 ; i < PACKET_PARSE ; i++) { 
+                if(pkt_cnt > 0 && i >= pkt_cnt) break; 
+                struct rte_mbuf *mbuf = pkts[i]; 
+                if(mbuf == 0x0) break; 
+                struct rte_ether_hdr eth_hdr; 
+                struct rte_ipv4_hdr ip_hdr; 
+                struct rte_tcp_hdr tcp_hdr; 
+                char *ether_hdr = mbuf->buf_addr + mbuf->data_off; 
+                bpf_probe_read(&eth_hdr, (size_t)sizeof(eth_hdr), ether_hdr); 
+                u16 proto = eth_hdr.ether_type; 
+                if(proto != ETHER_TYPE) continue; 
+                bpf_probe_read(&ip_hdr, (size_t)sizeof(ip_hdr), ether_hdr + sizeof(struct rte_ether_hdr)); 
+                if((ip_hdr.version_ihl >> 4) != IPV4_TYPE) continue; 
+                proto = ip_hdr.next_proto_id; 
+                if(proto != TCP_TYPE) continue; 
+                bpf_probe_read(&tcp_hdr, (size_t)sizeof(tcp_hdr), ether_hdr + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)); 
+                struct flow_info fi = {ip_hdr.src_addr, ip_hdr.dst_addr, tcp_hdr.src_port, tcp_hdr.dst_port}; 
+                 
+            u8 *used = mlx5_rx_burst_used.lookup(&fi); 
+            if(used == NULL || *used == 0) continue;  
+            u64 *pkt_len = mlx5_rx_burst_pkt_len.lookup(&fi);  
+            if(pkt_len == NULL) continue; 
+            u32 *array_index = mlx5_rx_burst_index.lookup_or_try_init(&fi, (u32*)&zero); 
+            if(array_index == NULL) continue;  
+            struct data_type data = {}; 
+            data.src_addr = ip_hdr.src_addr, data.dst_addr = ip_hdr.dst_addr; 
+            data.src_port = tcp_hdr.src_port, data.dst_port = tcp_hdr.dst_port; 
+            data.pid = pid; 
+            data.ts = bpf_ktime_get_boot_ns(); 
+            data.pkt_len = *pkt_len, data.e_count = *e_count; 
+            data.sent_seq = tcp_hdr.sent_seq, data.recv_ack = tcp_hdr.recv_ack; 
+            data.evt_type = 3; 
+            mlx5_rx_burst_array.update(array_index, &data); 
+             
+            (*array_index)++; 
+            if(*array_index >= EVENT_BATCH) { 
+                output_queue(3); 
+                mlx5_rx_burst_index.update(&fi, (u32*)&zero); 
+            } 
+            else mlx5_rx_burst_index.update(&fi, array_index); 
+            mlx5_rx_burst_used.update(&fi, (u8*)&zero); 
+            } 
+             
+            rx_poll_count.update(&pid, e_count);return  0;}
